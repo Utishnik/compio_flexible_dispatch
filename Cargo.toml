@@ -3,4 +3,12 @@ name = "compio_flexible_dispatch"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "compio_flexible_dispatch"          
+path = "src/lib.rs"
+
 [dependencies]
+compio-driver = "0.12.5"
+compio-runtime = "0.12.6"
+crossfire = "3.1.22"
+kanal = "0.1.1"
