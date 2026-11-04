@@ -10,6 +10,44 @@ use std::{
     thread::{JoinHandle, available_parallelism},
 };
 
+/// Generates two versions of a function from a single definition: the named
+/// one, annotated with `#[track_caller]`, and a sibling with the same
+/// signature and body but without the attribute.
+///
+/// Attributes, including doc comments, are applied to both versions. The
+/// signature and the body are written once, so the pair cannot drift apart.
+///
+/// ```ignore
+/// track_caller_pair! {
+///     /// Does something.
+///     pub fn foo => foo_untracked
+///     <T>(x: T) -> io::Result<()> {
+///         // ...
+///     }
+/// }
+/// ```
+macro_rules! track_caller_pair {
+    (
+        $(#[$attr:meta])*
+        $vis:vis fn $name:ident => $untracked:ident $($body:tt)*
+    ) => {
+        $(#[$attr])*
+        #[track_caller]
+        $vis fn $name $($body)*
+
+        $(#[$attr])*
+        #[doc = concat!(
+            "Untracked counterpart of [`",
+            stringify!($name),
+            "`]: identical, but without `#[track_caller]`."
+        )]
+        // May be unused inside the crate; it exists so callers can opt out of
+        // `#[track_caller]`.
+        #[allow(dead_code)]
+        $vis fn $untracked $($body)*
+    };
+}
+
 struct Spawning {
     task: Box<dyn Spawnable + Send>,
     meta: SpawnMeta,
@@ -67,82 +105,86 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    #[track_caller]
-    pub(crate) fn new_impl(builder: DispatcherBuilder) -> io::Result<Self> {
-        let DispatcherBuilder {
-            nthreads,
-            concurrent,
-            stack_size,
-            mut thread_affinity,
-            mut names,
-            mut proactor_builder,
-        } = builder;
-        proactor_builder.force_reuse_thread_pool();
-        let pool = proactor_builder.create_or_get_thread_pool();
-        let (sender, receiver) = unbounded::<Spawning>();
-        // Captured out here, since `#[track_caller]` does not reach into the
-        // closures the threads run, and every worker belongs to this call.
-        let meta = SpawnMeta::capture().named("dispatcher::worker");
+    track_caller_pair! {
+        pub(crate) fn new_impl => new_impl_untracked
+        (builder: DispatcherBuilder) -> io::Result<Self> {
+            let DispatcherBuilder {
+                nthreads,
+                concurrent,
+                stack_size,
+                mut thread_affinity,
+                mut names,
+                mut proactor_builder,
+            } = builder;
+            proactor_builder.force_reuse_thread_pool();
+            let pool = proactor_builder.create_or_get_thread_pool();
+            let (sender, receiver) = unbounded::<Spawning>();
+            // Captured out here, since `#[track_caller]` does not reach into the
+            // closures the threads run, and every worker belongs to this call.
+            let meta = SpawnMeta::capture().named("dispatcher::worker");
 
-        let threads = (0..nthreads)
-            .map({
-                |index| {
-                    let proactor_builder = proactor_builder.clone();
-                    let receiver = receiver.clone();
+            let threads = (0..nthreads)
+                .map({
+                    |index| {
+                        let proactor_builder = proactor_builder.clone();
+                        let receiver = receiver.clone();
 
-                    let thread_builder = std::thread::Builder::new();
-                    let thread_builder = if let Some(s) = stack_size {
-                        thread_builder.stack_size(s)
-                    } else {
-                        thread_builder
-                    };
-                    let thread_builder = if let Some(f) = &mut names {
-                        thread_builder.name(f(index))
-                    } else {
-                        thread_builder
-                    };
+                        let thread_builder = std::thread::Builder::new();
+                        let thread_builder = if let Some(s) = stack_size {
+                            thread_builder.stack_size(s)
+                        } else {
+                            thread_builder
+                        };
+                        let thread_builder = if let Some(f) = &mut names {
+                            thread_builder.name(f(index))
+                        } else {
+                            thread_builder
+                        };
 
-                    let cpus = if let Some(f) = &mut thread_affinity {
-                        f(index)
-                    } else {
-                        HashSet::new()
-                    };
-                    thread_builder.spawn(move || {
-                        Runtime::builder()
-                            .with_proactor(proactor_builder)
-                            .thread_affinity(cpus)
-                            .build()
-                            .expect("cannot create compio runtime")
-                            .block_on_at(
-                                async move {
-                                    while let Ok(Spawning { task: f, meta }) =
-                                        receiver.as_async().recv().await
-                                    {
-                                        let task = Runtime::with_current(|rt| f.spawn(rt, meta));
-                                        if concurrent {
-                                            task.detach()
-                                        } else {
-                                            task.await.ok();
+                        let cpus = if let Some(f) = &mut thread_affinity {
+                            f(index)
+                        } else {
+                            HashSet::new()
+                        };
+                        thread_builder.spawn(move || {
+                            Runtime::builder()
+                                .with_proactor(proactor_builder)
+                                .thread_affinity(cpus)
+                                .build()
+                                .expect("cannot create compio runtime")
+                                .block_on_at(
+                                    async move {
+                                        while let Ok(Spawning { task: f, meta }) =
+                                            receiver.as_async().recv().await
+                                        {
+                                            let task = Runtime::with_current(|rt| f.spawn(rt, meta));
+                                            if concurrent {
+                                                task.detach()
+                                            } else {
+                                                task.await.ok();
+                                            }
                                         }
-                                    }
-                                },
-                                meta,
-                            );
-                    })
-                }
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+                                    },
+                                    meta,
+                                );
+                        })
+                    }
+                })
+                .collect::<io::Result<Vec<_>>>()?;
 
-        Ok(Self {
-            sender,
-            threads,
-            pool,
-        })
+            Ok(Self {
+                sender,
+                threads,
+                pool,
+            })
+        }
     }
 
-    #[track_caller]
-    pub fn new() -> io::Result<Self> {
-        Self::builder().build()
+    track_caller_pair! {
+        pub fn new => new_untracked
+        () -> io::Result<Self> {
+            Self::builder().build()
+        }
     }
 
     /// Create a builder to build a dispatcher.
@@ -150,34 +192,33 @@ impl Dispatcher {
         DispatcherBuilder::default()
     }
 
-    /// Dispatch a task to the threads
-    ///
-    /// The provided `f` should be [`Send`] because it will be send to another
-    /// thread before calling. The returned [`Future`] need not to be [`Send`]
-    /// because it will be executed on only one thread.
-    ///
-    /// # Error
-    ///
-    /// If all threads have panicked, this method will return an error with the
-    /// sent closure.
-    #[track_caller]
-    pub fn dispatch<F, R>(
-        &self,
-        f: F,
-    ) -> Result<oneshot::RxOneshot<R>, DispatchError<kanal::SendError>>
-    where
-        F: AsyncFnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let (concrete, rx) = Concrete::new(f);
+    track_caller_pair! {
+        /// Dispatch a task to the threads
+        ///
+        /// The provided `f` should be [`Send`] because it will be send to another
+        /// thread before calling. The returned [`Future`] need not to be [`Send`]
+        /// because it will be executed on only one thread.
+        ///
+        /// # Error
+        ///
+        /// If all threads have panicked, this method will return an error with the
+        /// sent closure.
+        pub fn dispatch => dispatch_untracked
+        <F, R>(&self, f: F) -> Result<oneshot::RxOneshot<R>, DispatchError<kanal::SendError>>
+        where
+            F: AsyncFnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            let (concrete, rx) = Concrete::new(f);
 
-        let meta = SpawnMeta::capture().named("dispatch");
-        match self.sender.send(Spawning {
-            task: Box::new(concrete),
-            meta,
-        }) {
-            Ok(_) => Ok(rx),
-            Err(err) => Err(DispatchError(err)),
+            let meta = SpawnMeta::capture().named("dispatch");
+            match self.sender.send(Spawning {
+                task: Box::new(concrete),
+                meta,
+            }) {
+                Ok(_) => Ok(rx),
+                Err(err) => Err(DispatchError(err)),
+            }
         }
     }
 
@@ -300,10 +341,12 @@ impl DispatcherBuilder {
         self
     }
 
-    /// Build the [`Dispatcher`].
-    #[track_caller]
-    pub fn build(self) -> io::Result<Dispatcher> {
-        Dispatcher::new_impl(self)
+    track_caller_pair! {
+        /// Build the [`Dispatcher`].
+        pub fn build => build_untracked
+        (self) -> io::Result<Dispatcher> {
+            Dispatcher::new_impl(self)
+        }
     }
 }
 
